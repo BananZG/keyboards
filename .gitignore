@@ -5,3 +5,9 @@
 production
 jlcpcb
 fp-info-cache
+
+# Ignore build output directories
+out
+
+# Ignore IDE/editor config directories
+.vscode

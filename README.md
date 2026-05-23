@@ -1,7 +1,70 @@
 # keyboards
 
 This repository was created to manage the circuitry and firmware for the keyboards I designed.  
-The firmware is created using [sago35/tinygo-keyboard](https://github.com/sago35/tinygo-keyboard).  
+The firmware is created using [sago35/tinygo-keyboard](https://github.com/sago35/tinygo-keyboard).
+
+## Getting Started with TinyGo
+
+### Prerequisites
+
+The following are required to build and flash firmware:
+
+- **Git** — https://git-scm.com/downloads
+- **Go** — https://go.dev/dl/ (see [installation guide](https://go.dev/doc/install))
+- **TinyGo** — https://github.com/tinygo-org/tinygo/releases/latest (see [installation guide](https://tinygo.org/getting-started/install/))
+
+### Version Compatibility
+
+TinyGo requires compatible Go versions. Use the latest TinyGo release with one of these Go versions:
+
+| TinyGo | Go         |
+|--------|-----------|
+| 0.41+  | 1.26 - 1.25 |
+| 0.40   | 1.25 - 1.24 |
+
+Check your installations:
+
+```bash
+$ tinygo version
+tinygo version 0.41.1 darwin/arm64 (using go version go1.26.3 and LLVM version 20.1.1)
+
+$ go version
+go version go1.26.3 darwin/arm64
+```
+
+### Building and Flashing
+
+To build and flash a specific keyboard, use the Makefile with the `KEY` parameter:
+
+```bash
+# Build only
+make build KEY=zero-kb02
+
+# Flash to device
+make flash KEY=zero-kb02
+
+# Build and flash together
+make build-flash KEY=zero-kb02
+
+# Run full build for all keyboards
+make smoketest
+
+# List available keyboards
+make list-keyboards
+```
+
+### IDE Setup (for VS Code only)
+
+Install VS Code extensions for better development experience:
+
+- **TinyGo** — Official TinyGo support for VS Code
+
+Then click on the TinyGo status bar element at the bottom of the screen and select a target - based on your target chip/board name
+
+> Hint:
+> You can find the names from Makefile, eg: `zero-kb02`'s target is `waveshare-rp2040-zero`.
+
+These extensions help resolve `machine.*` package errors by configuring gopls for TinyGo's special standard library.
 
 ## sg24
 
