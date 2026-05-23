@@ -109,6 +109,12 @@ func run() error {
 	initialLayer[11] = jp.MouseRight  // Mouse right click
 
 	mk := d.AddMatrixKeyboard(colPins, rowPins, [][]keyboard.Keycode{initialLayer[:]})
+	// AddMatrixKeyboard only populates layer 0; prime layers 1-2 now so the
+	// keyboard works in all rotary modes from startup (before any FN press).
+	fillLayerKeys(d, PageLowerA)
+	setMatrixKey(d, 9, jp.KeyBackspace)
+	setMatrixKey(d, 10, jp.MouseLeft)
+	setMatrixKey(d, 11, jp.MouseRight)
 
 	mk.SetCallback(func(layer, index int, state keyboard.State) {
 		row := index / 4
@@ -120,19 +126,18 @@ func run() error {
 		if row == 2 && col == 0 {
 			if state == keyboard.Press {
 				pm.SetFN(true)
-				// Zero ALL matrix keycodes while FN is held so no regular
-				// keys (rows 0-1) or fixed row-2 keys fire alongside FN.
-				// Index 8 (FN) is already 0; setting it again is harmless.
+				// Zero ALL matrix keycodes on every rotary layer while FN is
+				// held so no keys fire regardless of the active rotary layer.
 				for i := 0; i < 12; i++ {
-					d.SetKeycode(0, 0, i, 0)
+					setMatrixKey(d, i, 0)
 				}
 			} else if state == keyboard.PressToRelease {
 				pm.SetFN(false)
 				fillLayerKeys(d, int(pm.currentPage))
-				// Restore fixed row-2 non-FN keys
-				d.SetKeycode(0, 0, 9, jp.KeyBackspace)
-				d.SetKeycode(0, 0, 10, jp.MouseLeft)
-				d.SetKeycode(0, 0, 11, jp.MouseRight)
+				// Restore fixed row-2 non-FN keys on all rotary layers
+				setMatrixKey(d, 9, jp.KeyBackspace)
+				setMatrixKey(d, 10, jp.MouseLeft)
+				setMatrixKey(d, 11, jp.MouseRight)
 			}
 			changed.Set(1)
 			return
@@ -174,7 +179,17 @@ func run() error {
 		{jp.KeyLeft, jp.KeyRight},                            // layer 1: cursor
 		{jp.KeyMediaBrightnessDown, jp.KeyMediaBrightnessUp}, // layer 2: brightness
 	})
-	_ = rk // rotary callbacks registered inside the library
+	// When the rotary turns, show a white comet chasing the direction.
+	// index 0 = CCW (decrease), index 1 = CW (increase).
+	rk.SetCallback(func(layer, index int, state keyboard.State) {
+		if state == keyboard.Press {
+			dir := 1
+			if index == 0 {
+				dir = -1
+			}
+			RotarySpinAdvance(dir)
+		}
+	})
 
 	gpioPins := []machine.Pin{machine.GPIO0, machine.GPIO2}
 	for i := range gpioPins {
@@ -246,21 +261,49 @@ func run() error {
 			m.Move(int(x.Get2()), int(y.Get2()))
 		}
 
-		// Rainbow LED update (every 32ms)
+		// LED update (every 32ms)
 		if cnt%32 == 0 {
 			mask := interrupt.Disable()
-			for i := range wsLeds {
-				if wsFlash[i] > 0 {
-					// Key-press flash: white fading to dark over 6 ticks
-					bright := uint32(wsFlash[i]) * 16 // 96 → 0
-					wsFlash[i]--
-					wsLeds[i] = (bright << 24) | (bright << 16) | (bright << 8)
-				} else {
-					// Idle: continuous rainbow, each LED offset by ~21 hue steps
-					wsLeds[i] = hsvToGRB(rainbowHue + uint8(i*22))
+			if wsSpinTimer > 0 {
+				// Rotary spin mode: dark background, white comet on outer ring.
+				// Head (0x60) + two fading trail LEDs (0x18, 0x06); inner LEDs off.
+				wsSpinTimer--
+				for i := range wsLeds {
+					wsLeds[i] = 0
 				}
+				for behind := 2; behind >= 0; behind-- {
+					ringPos := (int(wsSpinPos) - behind + 10) % 10
+					ledIdx := outerRing[ringPos]
+					switch behind {
+					case 0:
+						wsLeds[ledIdx] = 0x60606000 // head
+					case 1:
+						wsLeds[ledIdx] = 0x18181800 // trail 1
+					case 2:
+						wsLeds[ledIdx] = 0x06060600 // trail 2
+					}
+				}
+				// Key-press flash always wins over the comet
+				for i, f := range wsFlash {
+					if f > 0 {
+						bright := uint32(f) * 16
+						wsLeds[i] = (bright << 24) | (bright << 16) | (bright << 8)
+						wsFlash[i]--
+					}
+				}
+			} else {
+				// Rainbow mode: continuous hue rotation, flash on key press
+				for i := range wsLeds {
+					if wsFlash[i] > 0 {
+						bright := uint32(wsFlash[i]) * 16
+						wsFlash[i]--
+						wsLeds[i] = (bright << 24) | (bright << 16) | (bright << 8)
+					} else {
+						wsLeds[i] = hsvToGRB(rainbowHue + uint8(i*22))
+					}
+				}
+				rainbowHue++
 			}
-			rainbowHue++
 			ws.WriteRaw(wsLeds[:])
 			interrupt.Restore(mask)
 		}
@@ -322,13 +365,20 @@ func run() error {
 	}
 }
 
-// fillLayerKeys updates the matrix keycodes for rows 0-1 to match the given page.
-// kbIndex 0 is always the matrix keyboard (first registered).
-// Call this on page change and on FN key release.
+// setMatrixKey sets a matrix keycode on all three rotary layers (0-2) so the
+// key works regardless of which rotary encoder mode is currently active.
+func setMatrixKey(d *keyboard.Device, idx int, key keyboard.Keycode) {
+	d.SetKeycode(0, 0, idx, key)
+	d.SetKeycode(1, 0, idx, key)
+	d.SetKeycode(2, 0, idx, key)
+}
+
+// fillLayerKeys updates rows 0-1 of the matrix for the given page across all
+// rotary layers so typing works in every rotary encoder mode.
 func fillLayerKeys(d *keyboard.Device, page int) {
 	for row := 0; row < 2; row++ {
 		for col := 0; col < 4; col++ {
-			d.SetKeycode(0, 0, row*4+col, keyPages[page][row][col])
+			setMatrixKey(d, row*4+col, keyPages[page][row][col])
 		}
 	}
 }

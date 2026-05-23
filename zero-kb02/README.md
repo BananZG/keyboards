@@ -118,6 +118,8 @@ The current layer name is shown on the OLED for ~1.6 seconds each time you switc
 
 When a key is pressed, the corresponding LED **flashes bright white** and fades back to the rainbow over ~200 ms.
 
+When the **rotary encoder turns**, the LEDs switch to a **white comet** effect: a bright white head LED with two fading trail LEDs chases the direction of rotation. The comet advances one position per encoder notch, so turning slowly moves it slowly; spinning quickly moves it quickly. The LEDs hold the comet for ~800 ms after the last notch, then fade back to rainbow.
+
 ---
 
 ## OLED Display
@@ -199,5 +201,3 @@ make build-flash KEY=zero-kb02
 ```
 
 The compiled `.uf2` is written to `out/zero-kb02.uf2`.
-
-**Build size** (approximate): ~209 KB flash, ~47 KB RAM.
