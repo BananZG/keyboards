@@ -1,17 +1,12 @@
 package main
 
 import (
-	_ "embed"
-	"errors"
-	"image/color"
 	"log"
 	"machine"
 	"machine/usb"
 	"machine/usb/hid/mouse"
-	"math/rand/v2"
 	"runtime/interrupt"
 	"runtime/volatile"
-	"strconv"
 	"time"
 
 	"github.com/sago35/koebiten"
@@ -23,48 +18,19 @@ import (
 	"github.com/tinygo-org/pio/rp2-pio/piolib"
 	"tinygo.org/x/drivers"
 	"tinygo.org/x/drivers/ssd1306"
-	"tinygo.org/x/tinyfont"
-	"tinygo.org/x/tinyfont/freemono"
 )
 
-const (
-	SCREENSAVER = iota
-	LAYER
-)
-
-var (
-	invertRotaryPins = false
-	currentLayer     = 0
-	displayShowing   = SCREENSAVER
-	displayFrame     = 0
-	koebitenEnable   = false
-
-	textWhite = color.RGBA{255, 255, 255, 255}
-	textBlack = color.RGBA{0, 0, 0, 255}
-)
+// ---- Main ----
 
 func main() {
 	usb.Product = "zero-kb02-0.1.0"
-
-	err := run()
-	if err != nil {
+	if err := run(); err != nil {
 		log.Fatal(err)
 	}
 }
 
-const (
-	white = 0x3F3F3FFF
-	red   = 0x00FF00FF
-	green = 0xFF0000FF
-	blue  = 0x0000FFFF
-	black = 0x000000FF
-)
-
-func writeColors(s pio.StateMachine, ws *piolib.WS2812B, colors []uint32) {
-	ws.WriteRaw(colors)
-}
-
 func run() error {
+	// --- I2C / Display setup ---
 	i2c := machine.I2C0
 	i2c.Configure(machine.I2CConfig{
 		Frequency: 2.8 * machine.MHz,
@@ -80,364 +46,293 @@ func run() error {
 		Rotation: drivers.Rotation180,
 	})
 	display.ClearDisplay()
-	displayBuffer := NewDisplayBuffer(display.Size())
 
-	var changed volatile.Register8
-	changed.Set(0)
+	displayBuf := NewDisplayBuffer(display.Size())
 
-	wsPin := machine.GPIO1
+	// --- WS2812B LED setup ---
 	s, _ := pio.PIO0.ClaimStateMachine()
-	ws, _ := piolib.NewWS2812B(s, wsPin)
-	err := ws.EnableDMA(true)
-	if err != nil {
+	ws, _ := piolib.NewWS2812B(s, machine.GPIO1)
+	if err := ws.EnableDMA(true); err != nil {
 		return err
 	}
-	wsLeds := [12]uint32{}
-	for i := range wsLeds {
-		wsLeds[i] = black
-	}
-	writeColors(s, ws, wsLeds[:])
 
+	// wsLeds holds raw GRB values for all 12 LEDs.
+	// Pre-allocated here, never reallocated.
+	var wsLeds [12]uint32
+	var wsFlash [12]uint8 // flash countdown per key; each tick = 32 ms
+	var rainbowHue uint8
+
+	// --- ADC (joystick) ---
 	machine.InitADC()
-	ax := machine.GPIO29
-	ay := machine.GPIO28
-
 	m := mouse.Port()
+	x := NewADCDevice(machine.GPIO29, 0x3000, 0xC800, false)
+	y := NewADCDevice(machine.GPIO28, 0x3000, 0xC800, true)
 
+	// --- Keyboard driver ---
 	d := keyboard.New()
 
-	colPins := []machine.Pin{
-		machine.GPIO5,
-		machine.GPIO6,
-		machine.GPIO7,
-		machine.GPIO8,
-	}
+	colPins := []machine.Pin{machine.GPIO5, machine.GPIO6, machine.GPIO7, machine.GPIO8}
+	rowPins := []machine.Pin{machine.GPIO9, machine.GPIO10, machine.GPIO11}
 
-	rowPins := []machine.Pin{
-		machine.GPIO9,
-		machine.GPIO10,
-		machine.GPIO11,
-	}
+	// Page manager - allocated on stack, no heap
+	var pm PageManager
+	pm.Init()
 
-	mk := d.AddMatrixKeyboard(colPins, rowPins, [][]keyboard.Keycode{
-		{
-			jp.KeyA, jp.KeyB, jp.KeyC, jp.KeyD,
-			jp.KeyE, jp.KeyF, jp.KeyG, jp.KeyH,
-			jp.KeyMod1, jp.KeyMod2, jp.MouseLeft, jp.MouseRight,
-		},
-		{
-			jp.KeyI, jp.KeyJ, jp.KeyK, jp.KeyL,
-			jp.KeyM, jp.KeyN, jp.KeyO, jp.KeyP,
-			jp.KeyMod1, jp.KeyMod2, jp.MouseLeft, jp.MouseRight,
-		},
-		{
-			jp.KeyQ, jp.KeyR, jp.KeyS, jp.KeyT,
-			jp.KeyU, jp.KeyV, jp.KeyW, jp.KeyX,
-			jp.KeyMod1, jp.KeyMod2, jp.KeyY, jp.KeyZ,
-		},
-	})
+	// changed signals the display loop that LEDs/display need refreshing
+	var changed volatile.Register8
+
+	// ---- Matrix keyboard ----
+	// The tinygo-keyboard library calls our callback with the *vial layer*
+	// index (0-2) and the *physical key index* (0-11, row-major).
+	// We use the library's layer mechanism only for the rotary knob.
+	// For the matrix we always register on layer 0 and drive our own page
+	// logic here.
+	//
+	// Physical index layout (row-major, 4 cols × 3 rows):
+	//   Row 0: idx 0-3
+	//   Row 1: idx 4-7
+	//   Row 2: idx 8-11  →  FN(8) | Backspace(9) | MouseL(10) | MouseR(11)
+	//
+	// We give the matrix a single layer of placeholder codes; actual output
+	// is controlled via the callback + pm.EffectivePage().
+	// Build initial matrix layer: rows 0-1 start on PageLowerA, row 2 is fixed.
+	// d.SetKeycode(layer, kbIndex, index, key) updates rows 0-1 on page change.
+	var initialLayer [12]keyboard.Keycode
+	for row := 0; row < 2; row++ {
+		for col := 0; col < 4; col++ {
+			initialLayer[row*4+col] = keyPages[PageLowerA][row][col]
+		}
+	}
+	initialLayer[8] = 0               // FN key: no HID code, handled in callback
+	initialLayer[9] = jp.KeyBackspace // Delete/Backspace
+	initialLayer[10] = jp.MouseLeft   // Mouse left click
+	initialLayer[11] = jp.MouseRight  // Mouse right click
+
+	mk := d.AddMatrixKeyboard(colPins, rowPins, [][]keyboard.Keycode{initialLayer[:]})
+
 	mk.SetCallback(func(layer, index int, state keyboard.State) {
-		if state == keyboard.PressToRelease {
+		row := index / 4
+		col := index % 4
+
+		// ---- FN key (row 2, col 0) ----
+		// When held: zero rows 0-1 so no letters fire.
+		// When released: restore current page keycodes.
+		if row == 2 && col == 0 {
+			if state == keyboard.Press {
+				pm.SetFN(true)
+				// Zero ALL matrix keycodes while FN is held so no regular
+				// keys (rows 0-1) or fixed row-2 keys fire alongside FN.
+				// Index 8 (FN) is already 0; setting it again is harmless.
+				for i := 0; i < 12; i++ {
+					d.SetKeycode(0, 0, i, 0)
+				}
+			} else if state == keyboard.PressToRelease {
+				pm.SetFN(false)
+				fillLayerKeys(d, int(pm.currentPage))
+				// Restore fixed row-2 non-FN keys
+				d.SetKeycode(0, 0, 9, jp.KeyBackspace)
+				d.SetKeycode(0, 0, 10, jp.MouseLeft)
+				d.SetKeycode(0, 0, 11, jp.MouseRight)
+			}
+			changed.Set(1)
 			return
 		}
-		mask := interrupt.Disable()
-		idx := 0
-		switch index {
-		case 0:
-			idx = 0
-		case 1:
-			idx = 3
-		case 2:
-			idx = 6
-		case 3:
-			idx = 9
-		case 4:
-			idx = 1
-		case 5:
-			idx = 4
-		case 6:
-			idx = 7
-		case 7:
-			idx = 10
-		case 8:
-			idx = 2
-		case 9:
-			idx = 5
-		case 10:
-			idx = 8
-		case 11:
-			idx = 11
-		}
-		wsLeds[idx] = rand.Uint32()
-		if layer != d.Layer() {
-			displayFrame = 0
-			currentLayer = d.Layer()
-			displayShowing = LAYER
-		}
-		interrupt.Restore(mask)
-		changed.Set(1)
-	})
 
-	rotaryPins := []machine.Pin{
-		machine.GPIO3,
-		machine.GPIO4,
-	}
-	if invertRotaryPins {
-		rotaryPins[0], rotaryPins[1] = rotaryPins[1], rotaryPins[0]
-	}
+		// ---- FN held + key press → page selection (all rows) ----
+		// fnPageKeys returns -1 for the FN key itself (row2,col0), so it is safe
+		// to remove the row<2 guard that was previously preventing row-3 shortcuts.
+		if pm.fnPressed && state == keyboard.Press {
+			if target := GetFNPageTarget(row, col); target >= 0 {
+				pm.SetPage(target)
+				// Keycodes restored to the new page when FN is released.
+			}
+			changed.Set(1)
+			return
+		}
 
-	rk := d.AddRotaryKeyboard(rotaryPins[0], rotaryPins[1], [][]keyboard.Keycode{
-		{
-			jp.KeyMediaVolumeDec, jp.KeyMediaVolumeInc,
-		},
-		{
-			jp.KeyLeft, jp.KeyRight,
-		},
-		{
-			jp.KeyMediaBrightnessDown, jp.KeyMediaBrightnessUp,
-		},
-	})
-	rkIndex := 0
-	rk.SetCallback(func(layer, index int, state keyboard.State) {
+		// ---- LED flash on key press ----
+		// Key sending for rows 0-1 and fixed row-2 keys is handled by the library
+		// based on the keycodes registered via SetKeycode / AddMatrixKeyboard.
 		if state == keyboard.Press {
-			if index == 0 {
-				rkIndex = (rkIndex + 1) % 10
-			} else {
-				rkIndex = (rkIndex - 1 + 10) % 10
-			}
-			idx := rkIndex
-			switch rkIndex {
-			case 0:
-				idx = 0
-			case 1:
-				idx = 1
-			case 2:
-				idx = 2
-			case 3:
-				idx = 5
-			case 4:
-				idx = 8
-			case 5:
-				idx = 11
-			case 6:
-				idx = 10
-			case 7:
-				idx = 9
-			case 8:
-				idx = 6
-			case 9:
-				idx = 3
-			}
 			mask := interrupt.Disable()
-			wsLeds[idx] = rand.Uint32()
-			if layer != d.Layer() {
-				displayFrame = 0
-				currentLayer = d.Layer()
-				displayShowing = LAYER
-			}
+			wsFlash[index] = 6 // 6 × 32 ms ≈ 192 ms fade
 			interrupt.Restore(mask)
 			changed.Set(1)
 		}
 	})
 
-	gpioPins := []machine.Pin{machine.GPIO0, machine.GPIO2}
-	for c := range gpioPins {
-		gpioPins[c].Configure(machine.PinConfig{Mode: machine.PinInputPullup})
+	// MouseLeft (index 10) and MouseRight (index 11) are part of the matrix.
+	// jp.MouseLeft / jp.MouseRight keycodes handle clicks via the library.
+
+	// ---- Rotary encoder (unchanged from original) ----
+	rotaryPins := [2]machine.Pin{machine.GPIO3, machine.GPIO4}
+	if invertRotaryPins {
+		rotaryPins[0], rotaryPins[1] = rotaryPins[1], rotaryPins[0]
 	}
-	gk := d.AddGpioKeyboard(gpioPins, [][]keyboard.Keycode{
-		{
-			jp.KeyTo5, jp.KeyTo1,
-		},
-		{
-			jp.KeyTo5, jp.KeyTo2,
-		},
-		{
-			jp.KeyTo5, jp.KeyTo0,
-		},
+	rk := d.AddRotaryKeyboard(rotaryPins[0], rotaryPins[1], [][]keyboard.Keycode{
+		{jp.KeyMediaVolumeDec, jp.KeyMediaVolumeInc},         // layer 0: volume
+		{jp.KeyLeft, jp.KeyRight},                            // layer 1: cursor
+		{jp.KeyMediaBrightnessDown, jp.KeyMediaBrightnessUp}, // layer 2: brightness
 	})
+	_ = rk // rotary callbacks registered inside the library
+
+	gpioPins := []machine.Pin{machine.GPIO0, machine.GPIO2}
+	for i := range gpioPins {
+		gpioPins[i].Configure(machine.PinConfig{Mode: machine.PinInputPullup})
+	}
+	var koebitenEnable bool // set true by gk callback, consumed in main loop
+	gk := d.AddGpioKeyboard(gpioPins, [][]keyboard.Keycode{
+		{jp.KeyTo5, jp.KeyTo1},
+		{jp.KeyTo5, jp.KeyTo2},
+		{jp.KeyTo5, jp.KeyTo0},
+	})
+	// On joystick press: library sends KeyTo5, moving to layer 5.
+	// On release at layer 5: signal game launch to the main loop.
 	gk.SetCallback(func(layer, index int, state keyboard.State) {
-		if state == keyboard.PressToRelease {
-			if currentLayer == 5 {
-				koebitenEnable = true
-			}
-			return
+		if state == keyboard.PressToRelease && d.Layer() == 5 {
+			koebitenEnable = true
 		}
-		mask := interrupt.Disable()
-		idx := 4
-		if index == 1 {
-			idx = 7
-		}
-		wsLeds[idx] = rand.Uint32()
-		if layer != d.Layer() {
-			displayFrame = 0
-			currentLayer = d.Layer()
-			displayShowing = LAYER
-		}
-		interrupt.Restore(mask)
-		changed.Set(1)
 	})
 
 	loadKeyboardDef()
-
 	d.Init()
-	cont := true
-	x := NewADCDevice(ax, 0x3000, 0xC800, false)
-	y := NewADCDevice(ay, 0x3000, 0xC800, true)
+
+	// ---- State ----
+	var (
+		displayMode  = showPageInfo
+		displayTimer = 0
+		rotaryLayer  = 0 // mirrors d.Layer() to detect rotary layer changes
+	)
+
+	dispx, dispy := int16(0), int16(0)
+	deltaX, deltaY := int16(1), int16(1)
+
 	cnt := 0
 
-	dispx := int16(0)
-	dispy := int16(0)
-	deltaX := int16(1)
-	deltaY := int16(1)
-	for cont {
+	for {
 		time.Sleep(1 * time.Millisecond)
-		err := d.Tick()
-		if err != nil {
+
+		if err := d.Tick(); err != nil {
 			return err
 		}
 
-		if cnt%10 == 0 {
-			xx := x.Get2()
-			yy := y.Get2()
-			//fmt.Printf("%04X %04X %4d %4d %4d %4d\n", x.RawValue, y.RawValue, xx, yy, x.Get(), y.Get())
-			m.Move(int(xx), int(yy))
+		// Launch koebiten game when joystick activated it
+		if koebitenEnable {
+			koebitenEnable = false
+			// Detach rotary encoder GPIO interrupts so the game framework can use them.
+			machine.GPIO3.SetInterrupt(machine.PinToggle, nil)
+			machine.GPIO4.SetInterrupt(machine.PinToggle, nil)
+			koebiten.SetHardware(hardware.Device)
+			koebiten.SetRotation(koebiten.Rotation0)
+			game := all.NewGame()
+			if err := koebiten.RunGame(game); err != nil {
+				log.Fatal(err)
+			}
+			game.RunCurrentGame()
 		}
 
+		// Detect rotary layer changes (GPIO keyboard sends KeyTo0/1/2/5)
+		if cur := d.Layer(); cur != rotaryLayer {
+			rotaryLayer = cur
+			if cur < 5 { // layer 5 is game mode; handled above
+				displayMode = showLayerInfo
+				displayTimer = 0
+				renderLayerInfo(display, cur)
+			}
+		}
+
+		// Joystick mouse movement (every 10ms)
+		if cnt%10 == 0 {
+			m.Move(int(x.Get2()), int(y.Get2()))
+		}
+
+		// Rainbow LED update (every 32ms)
 		if cnt%32 == 0 {
 			mask := interrupt.Disable()
-			for i, c := range wsLeds {
-				g := ((c & 0xFF000000) >> 1) & 0xFF000000
-				r := ((c & 0x00FF0000) >> 1) & 0x00FF0000
-				b := ((c & 0x0000FF00) >> 1) & 0x0000FF00
-				c = g | r | b | 0xFF
-				wsLeds[i] = c
+			for i := range wsLeds {
+				if wsFlash[i] > 0 {
+					// Key-press flash: white fading to dark over 6 ticks
+					bright := uint32(wsFlash[i]) * 16 // 96 → 0
+					wsFlash[i]--
+					wsLeds[i] = (bright << 24) | (bright << 16) | (bright << 8)
+				} else {
+					// Idle: continuous rainbow, each LED offset by ~21 hue steps
+					wsLeds[i] = hsvToGRB(rainbowHue + uint8(i*22))
+				}
 			}
-			writeColors(s, ws, wsLeds[:])
+			rainbowHue++
+			ws.WriteRaw(wsLeds[:])
 			interrupt.Restore(mask)
 		}
 
-		if cnt%32 == 16 {
-			pixel := displayBuffer.GetPixel(dispx, dispy)
-			c := textWhite
-			if pixel {
-				c = textBlack
-			}
-			displayBuffer.SetPixel(dispx, dispy, c)
-			dispx += deltaX
-			dispy += deltaY
-
-			if dispx == 0 || dispx == 127 {
-				deltaX = -deltaX
-			}
-
-			if dispy == 0 || dispy == 63 {
-				deltaY = -deltaY
-			}
-
-			switch displayShowing {
-			case LAYER:
-				if currentLayer == 5 {
-					if koebitenEnable {
-						display.ClearDisplay()
-						for i := range wsLeds {
-							wsLeds[i] = black
-						}
-						writeColors(s, ws, wsLeds[:])
-
-						machine.GPIO3.SetInterrupt(machine.PinToggle, nil)
-						machine.GPIO4.SetInterrupt(machine.PinToggle, nil)
-
-						koebiten.SetHardware(hardware.Device)
-						koebiten.SetRotation(koebiten.Rotation0)
-
-						game := all.NewGame()
-						if err := koebiten.RunGame(game); err != nil {
-							log.Fatal(err)
-						}
-						game.RunCurrentGame()
+		// Display update (every 16ms)
+		if cnt%16 == 0 {
+			if pm.ConsumeDisplayUpdate() {
+				if pm.fnPressed {
+					switch displayMode {
+					case showFNOverlay, showFNPreview:
+						// Page selected while FN held → preview new page name
+						renderPageInfo(display, displayBuf, int(pm.currentPage))
+						displayMode = showFNPreview
+						displayTimer = 0
+					default:
+						// FN key just pressed → show FN overlay
+						renderFNInfo(display)
+						displayMode = showFNOverlay
 					}
 				} else {
-					if displayFrame == 0 {
-						display.ClearDisplay()
-						_, w := tinyfont.LineWidth(&freemono.Regular12pt7b, "LAYER "+strconv.Itoa(currentLayer))
-						tinyfont.WriteLine(display, &freemono.Regular12pt7b, int16(128-w)/2, 40, "LAYER "+strconv.Itoa(currentLayer), textWhite)
-						display.Display()
-					} else if displayFrame > 20 {
-						display.ClearDisplay()
-						display.Display()
-						displayShowing = SCREENSAVER
-					}
+					// FN released or normal page change
+					renderPageInfo(display, displayBuf, pm.EffectivePage())
+					displayMode = showPageInfo
+					displayTimer = 0
 				}
-			case SCREENSAVER:
-				display.SetBuffer(displayBuffer.GetBuffer())
-				display.Display()
-
 			}
-			displayFrame++
+
+			switch displayMode {
+			case showPageInfo:
+				displayTimer++
+				if displayTimer > 200 { // ~3.2 s
+					displayMode = showScreensaver
+				}
+			case showLayerInfo:
+				displayTimer++
+				if displayTimer > 100 { // ~1.6 s
+					displayMode = showPageInfo
+					renderPageInfo(display, displayBuf, pm.EffectivePage())
+					displayTimer = 0
+				}
+			case showFNOverlay:
+				// Stays until ConsumeDisplayUpdate fires (page selected or FN released)
+			case showFNPreview:
+				displayTimer++
+				if displayTimer > 96 { // ~1.5 s
+					renderFNInfo(display)
+					displayMode = showFNOverlay
+					displayTimer = 0
+				}
+			case showScreensaver:
+				renderScreensaver(display, displayBuf, &dispx, &dispy, &deltaX, &deltaY)
+			}
 		}
 
 		cnt++
-	}
-
-	return nil
-}
-
-type DisplayBuffer struct {
-	buffer []byte
-	width  int16
-	height int16
-}
-
-func NewDisplayBuffer(width, height int16) *DisplayBuffer {
-	return &DisplayBuffer{
-		buffer: make([]byte, width*height/8),
-		width:  width,
-		height: height,
+		if cnt >= 1000 {
+			cnt = 0
+		}
 	}
 }
 
-func (d DisplayBuffer) Size() (x, y int16) {
-	return d.width, d.height
-}
-
-func (d *DisplayBuffer) SetPixel(x, y int16, c color.RGBA) {
-	if x < 0 || x >= d.width || y < 0 || y >= d.height {
-		return
-	}
-	byteIndex := x + (y/8)*d.width
-	if c.R != 0 || c.G != 0 || c.B != 0 {
-		d.buffer[byteIndex] |= 1 << uint8(y%8)
-	} else {
-		d.buffer[byteIndex] &^= 1 << uint8(y%8)
+// fillLayerKeys updates the matrix keycodes for rows 0-1 to match the given page.
+// kbIndex 0 is always the matrix keyboard (first registered).
+// Call this on page change and on FN key release.
+func fillLayerKeys(d *keyboard.Device, page int) {
+	for row := 0; row < 2; row++ {
+		for col := 0; col < 4; col++ {
+			d.SetKeycode(0, 0, row*4+col, keyPages[page][row][col])
+		}
 	}
 }
 
-func (d DisplayBuffer) Display() error {
-	return nil
-}
+// ---- Package-level vars kept to minimum ----
 
-func (d *DisplayBuffer) GetPixel(x int16, y int16) bool {
-	if x < 0 || x >= d.width || y < 0 || y >= d.height {
-		return false
-	}
-	byteIndex := x + (y/8)*d.width
-	return (d.buffer[byteIndex] >> uint8(y%8) & 0x1) == 1
-}
-
-func (d *DisplayBuffer) SetBuffer(buffer []byte) error {
-	if len(buffer) != len(d.buffer) {
-		return errBufferSize
-	}
-	for i := 0; i < len(d.buffer); i++ {
-		d.buffer[i] = buffer[i]
-	}
-	return nil
-}
-
-func (d *DisplayBuffer) GetBuffer() []byte {
-	return d.buffer
-}
-
-var (
-	errBufferSize = errors.New("invalid size buffer")
-)
+var invertRotaryPins = false
