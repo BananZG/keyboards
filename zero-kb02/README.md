@@ -94,7 +94,7 @@ The rotary encoder has **three modes**, cycled by pressing the encoder button:
 | Layer | Knob CCW | Knob CW | OLED |
 |-------|----------|---------|------|
 | 0 — Volume | Volume Down | Volume Up | `VOL` |
-| 1 — Cursor | ← Arrow | → Arrow | `CURSOR` |
+| 1 — Scroll | Scroll Down | Scroll Up | `SCROLL` |
 | 2 — Brightness | Brightness Down | Brightness Up | `BRIGHT` |
 
 The current layer name is shown on the OLED for ~1.6 seconds each time you switch.
@@ -129,7 +129,7 @@ The 128×64 OLED has five display states:
 | State | Trigger | Content | Duration |
 |-------|---------|---------|----------|
 | Page info | Page change / FN release | Page name + key hint (`abcd efgh`) | 3.2 s, then screensaver |
-| Layer info | Rotary layer change | Layer name (VOL / CURSOR / BRIGHT) | 1.6 s, then page info |
+| Layer info | Rotary layer change | Layer name (VOL / SCROLL / BRIGHT) | 1.6 s, then page info |
 | FN overlay | FN held | `FN` + `select:` | Until key pressed or FN released |
 | FN preview | FN held + page selected | Selected page name + key hint | 1.5 s, then back to FN overlay |
 | Screensaver | Idle after page info | Bouncing pixel | Until next event |

@@ -30,7 +30,7 @@ var (
 // ---- Render helpers ----
 
 // rotaryLayerNames maps vial layer index to a short display label.
-var rotaryLayerNames = [3]string{"VOL", "CURSOR", "BRIGHT"}
+var rotaryLayerNames = [3]string{"VOL", "SCROLL", "BRIGHT"}
 
 // renderPageInfo writes the current page name and key layout to the LCD.
 // Called once on page change; no heap allocations.
@@ -85,21 +85,29 @@ func renderLayerInfo(display *ssd1306.Device, layer int) {
 	display.Display()
 }
 
+// screensaverState holds the mutable position and velocity of the bouncing
+// pixel. Grouping them in a struct keeps the state together and means only
+// one pointer needs to be passed (and escape-analysed) by renderScreensaver.
+type screensaverState struct {
+	x, y   int16
+	dx, dy int16
+}
+
 // renderScreensaver advances the bouncing pixel screensaver.
-func renderScreensaver(display *ssd1306.Device, buf *DisplayBuffer, dispx, dispy, deltaX, deltaY *int16) {
-	pixel := buf.GetPixel(*dispx, *dispy)
+func renderScreensaver(display *ssd1306.Device, buf *DisplayBuffer, ss *screensaverState) {
+	pixel := buf.GetPixel(ss.x, ss.y)
 	c := textWhite
 	if pixel {
 		c = textBlack
 	}
-	buf.SetPixel(*dispx, *dispy, c)
-	*dispx += *deltaX
-	*dispy += *deltaY
-	if *dispx == 0 || *dispx == 127 {
-		*deltaX = -*deltaX
+	buf.SetPixel(ss.x, ss.y, c)
+	ss.x += ss.dx
+	ss.y += ss.dy
+	if ss.x == 0 || ss.x == 127 {
+		ss.dx = -ss.dx
 	}
-	if *dispy == 0 || *dispy == 63 {
-		*deltaY = -*deltaY
+	if ss.y == 0 || ss.y == 63 {
+		ss.dy = -ss.dy
 	}
 	display.SetBuffer(buf.GetBuffer())
 	display.Display()

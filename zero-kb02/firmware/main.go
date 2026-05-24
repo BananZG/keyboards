@@ -6,7 +6,6 @@ import (
 	"machine/usb"
 	"machine/usb/hid/mouse"
 	"runtime/interrupt"
-	"runtime/volatile"
 	"time"
 
 	"github.com/sago35/koebiten"
@@ -78,9 +77,6 @@ func run() error {
 	var pm PageManager
 	pm.Init()
 
-	// changed signals the display loop that LEDs/display need refreshing
-	var changed volatile.Register8
-
 	// ---- Matrix keyboard ----
 	// The tinygo-keyboard library calls our callback with the *vial layer*
 	// index (0-2) and the *physical key index* (0-11, row-major).
@@ -97,20 +93,12 @@ func run() error {
 	// is controlled via the callback + pm.EffectivePage().
 	// Build initial matrix layer: rows 0-1 start on PageLowerA, row 2 is fixed.
 	// d.SetKeycode(layer, kbIndex, index, key) updates rows 0-1 on page change.
-	var initialLayer [12]keyboard.Keycode
-	for row := 0; row < 2; row++ {
-		for col := 0; col < 4; col++ {
-			initialLayer[row*4+col] = keyPages[PageLowerA][row][col]
-		}
-	}
-	initialLayer[8] = 0               // FN key: no HID code, handled in callback
-	initialLayer[9] = jp.KeyBackspace // Delete/Backspace
-	initialLayer[10] = jp.MouseLeft   // Mouse left click
-	initialLayer[11] = jp.MouseRight  // Mouse right click
+	// The initial keycodes passed to AddMatrixKeyboard are immediately overwritten
+	// by fillLayerKeys below, so pass a zero-initialized placeholder.
+	var blankLayer [12]keyboard.Keycode
 
-	mk := d.AddMatrixKeyboard(colPins, rowPins, [][]keyboard.Keycode{initialLayer[:]})
-	// AddMatrixKeyboard only populates layer 0; prime layers 1-2 now so the
-	// keyboard works in all rotary modes from startup (before any FN press).
+	mk := d.AddMatrixKeyboard(colPins, rowPins, [][]keyboard.Keycode{blankLayer[:]})
+	// Prime all three rotary layers so the keyboard works before the first FN press.
 	fillLayerKeys(d, PageLowerA)
 	setMatrixKey(d, 9, jp.KeyBackspace)
 	setMatrixKey(d, 10, jp.MouseLeft)
@@ -139,7 +127,6 @@ func run() error {
 				setMatrixKey(d, 10, jp.MouseLeft)
 				setMatrixKey(d, 11, jp.MouseRight)
 			}
-			changed.Set(1)
 			return
 		}
 
@@ -151,7 +138,6 @@ func run() error {
 				pm.SetPage(target)
 				// Keycodes restored to the new page when FN is released.
 			}
-			changed.Set(1)
 			return
 		}
 
@@ -162,7 +148,6 @@ func run() error {
 			mask := interrupt.Disable()
 			wsFlash[index] = 6 // 6 × 32 ms ≈ 192 ms fade
 			interrupt.Restore(mask)
-			changed.Set(1)
 		}
 	})
 
@@ -176,7 +161,7 @@ func run() error {
 	}
 	rk := d.AddRotaryKeyboard(rotaryPins[0], rotaryPins[1], [][]keyboard.Keycode{
 		{jp.KeyMediaVolumeDec, jp.KeyMediaVolumeInc},         // layer 0: volume
-		{jp.KeyLeft, jp.KeyRight},                            // layer 1: cursor
+		{jp.WheelDown, jp.WheelUp},                           // layer 1: scroll
 		{jp.KeyMediaBrightnessDown, jp.KeyMediaBrightnessUp}, // layer 2: brightness
 	})
 	// When the rotary turns, show a white comet chasing the direction.
@@ -192,8 +177,8 @@ func run() error {
 	})
 
 	gpioPins := []machine.Pin{machine.GPIO0, machine.GPIO2}
-	for i := range gpioPins {
-		gpioPins[i].Configure(machine.PinConfig{Mode: machine.PinInputPullup})
+	for _, p := range gpioPins {
+		p.Configure(machine.PinConfig{Mode: machine.PinInputPullup})
 	}
 	var koebitenEnable bool // set true by gk callback, consumed in main loop
 	gk := d.AddGpioKeyboard(gpioPins, [][]keyboard.Keycode{
@@ -219,8 +204,7 @@ func run() error {
 		rotaryLayer  = 0 // mirrors d.Layer() to detect rotary layer changes
 	)
 
-	dispx, dispy := int16(0), int16(0)
-	deltaX, deltaY := int16(1), int16(1)
+	ss := screensaverState{dx: 1, dy: 1}
 
 	cnt := 0
 
@@ -354,12 +338,12 @@ func run() error {
 					displayTimer = 0
 				}
 			case showScreensaver:
-				renderScreensaver(display, displayBuf, &dispx, &dispy, &deltaX, &deltaY)
+				renderScreensaver(display, displayBuf, &ss)
 			}
 		}
 
 		cnt++
-		if cnt >= 1000 {
+		if cnt >= 160 { // LCM(10, 16, 32): all three update intervals divide evenly
 			cnt = 0
 		}
 	}
@@ -385,4 +369,4 @@ func fillLayerKeys(d *keyboard.Device, page int) {
 
 // ---- Package-level vars kept to minimum ----
 
-var invertRotaryPins = false
+const invertRotaryPins = false
