@@ -1,6 +1,6 @@
 # zero-kb02 Firmware
 
-Custom firmware for the **zero-kb02** — a compact 4×3 macro pad built around the Waveshare RP2040-Zero microcontroller. Written in [TinyGo](https://tinygo.org/) using the [sago35/tinygo-keyboard](https://github.com/sago35/tinygo-keyboard) framework.
+Custom firmware for the **zero-kb02** — a compact 4×3 macro pad built around the Waveshare RP2040-Zero microcontroller. Written in [TinyGo](https://tinygo.org/) using the [sago35/tinygo-keyboard](https://github.com/sago35/tinygo-keyboard) framework with [Vial](https://get.vial.today/) live key-remapping support.
 
 ---
 
@@ -23,81 +23,77 @@ Custom firmware for the **zero-kb02** — a compact 4×3 macro pad built around 
 ┌──────┬──────┬──────┬──────┐
 │  K1  │  K2  │  K3  │  K4  │  ← Row 0
 ├──────┼──────┼──────┼──────┤
-│  K5  │  K6  │  K7  │  K8  │  ← Row 1
+│ Sft  │  K6  │  K7  │  K8  │  ← Row 1  (K5 = Left Shift)
 ├──────┼──────┼──────┼──────┤
-│  FN  │  ⌫   │ 🖱 L  │ 🖱 R  │  ← Row 2 (fixed)
+│  FN  │  ⌫   │ 🖱 L  │ 🖱 R  │  ← Row 2 (always fixed)
 └──────┴──────┴──────┴──────┘
 ```
 
-**Row 2 is always fixed** regardless of the active page:
+**Row 2 is always fixed** across every layer:
 
 | Key | Function |
 |-----|----------|
-| FN | Hold to enter page-selection mode |
-| ⌫ | Backspace / Delete |
+| FN | Hold to enter layer-selection mode |
+| ⌫ | Backspace |
 | 🖱 L | Mouse left click |
 | 🖱 R | Mouse right click |
 
 ---
 
-## Page System
+## Layer System
 
-Because the device only has 8 typeable keys (Rows 0–1), the firmware uses a **page system** to give access to the full alphabet, numbers, symbols, and navigation keys. Each page assigns a different set of characters to the 8 keys.
+The firmware uses **6 combined Vial layers**. Each layer is a complete, self-contained key configuration — the rotary encoder mode, the letter/number keys, and the Shift key position all live in the same layer. Switching layers instantly changes everything at once.
 
-There are **11 pages** in total:
+| Layer | OLED | Row 0 (K1–K4) | Row 1 (Sft, K6–K8) | Rotary knob |
+|-------|------|---------------|---------------------|-------------|
+| 0 | `L-0  VOL` | a b c d | **Shift** e f g | Volume ▲▼ |
+| 1 | `L-1  SCR` | h i j k | **Shift** l m n | Scroll ▲▼ |
+| 2 | `L-2  BRT` | o p q r | **Shift** s t u | Brightness ▲▼ |
+| 3 | `L-3` | v w x y | **Shift** z 0 1 | *(unbound)* |
+| 4 | `L-4` | 2 3 4 5 | 6 7 8 9 | *(unbound)* |
+| 5 | `L-5` | Home ↑ End PgUp | ← ↓ → PgDn | *(unbound)* |
 
-| # | Name | Row 0 (K1–K4) | Row 1 (K5–K8) |
-|---|------|---------------|---------------|
-| 0 | a-h  | a b c d | e f g h |
-| 1 | i-p  | i j k l | m n o p |
-| 2 | q-x  | q r s t | u v w x |
-| 3 | y-z  | y z ␣ ↵ | , . / - |
-| 4 | A-H  | A B C D | E F G H |
-| 5 | I-P  | I J K L | M N O P |
-| 6 | Q-X  | Q R S T | U V W X |
-| 7 | Y-Z  | Y Z ␣ ↵ | : ; = ^ |
-| 8 | 1-8  | 1 2 3 4 | 5 6 7 8 |
-| 9 | 9-0  | 9 0 - . | ( ) = , |
-| 10 | NAV | Home ↑ End PgUp | ← ↓ → PgDn |
+The **Shift key** at K5 is a standard HID Left Shift — hold it and press any letter key on the same layer to type the uppercase version, just like a regular keyboard.
 
 ---
 
-## FN Key — Page Selection
+## FN Key — Layer Selection
 
-**Hold FN** (bottom-left key) to enter page-selection mode.
+**Hold FN** (bottom-left, Row 2) to enter layer-selection mode.
 
-While FN is held, the 11 keys act as **page shortcuts** — the layout mirrors the page table above:
+While FN is held, **K1–K6 select layers 0–5**, and **row 2 becomes Tab / Space / Enter**:
 
 ```
 ┌────────┬────────┬────────┬────────┐
-│  a-h   │  i-p   │  q-x   │  y-z   │  ← Row 0: lowercase pages
+│ Lyr 0  │ Lyr 1  │ Lyr 2  │ Lyr 3  │  ← Row 0: K1-K4
 ├────────┼────────┼────────┼────────┤
-│  A-H   │  I-P   │  Q-X   │  Y-Z   │  ← Row 1: uppercase pages
+│ Lyr 4  │ Lyr 5  │   —    │   —    │  ← Row 1: K5-K6 (K7-K8 inactive)
 ├────────┼────────┼────────┼────────┤
-│ (hold) │  1-8   │  9-0   │  NAV   │  ← Row 2: number / nav pages
+│ (hold) │  Tab   │ Space  │ Enter  │  ← Row 2: FN + Tab/Space/Enter
 └────────┴────────┴────────┴────────┘
 ```
 
 **Behaviour:**
-- All regular key output is suppressed while FN is held — no accidental characters.
+- All regular key output is suppressed while FN is held.
 - The OLED shows **"FN / select:"** while waiting.
-- When a page key is pressed, the OLED **previews the selected page name** for ~1.5 seconds, then returns to the FN overlay (so you can keep selecting).
-- **Pressing the same page repeatedly resets the preview timer** — handy for confirming your selection.
-- Releasing FN commits the page and shows the full page info screen.
+- Pressing a layer key switches to that layer and shows a **brief preview** of the new layer's name and key hints (~1.5 s), then returns to the FN overlay.
+- Tab, Space, and Enter are available at row 2 as normal key output while FN is held.
+- Releasing FN confirms the selection and shows the current layer info.
 
 ---
 
 ## Rotary Encoder
 
-The rotary encoder has **three modes**, cycled by pressing the encoder button:
+The rotary encoder button **cycles through all 6 layers in order** (0→1→2→3→4→5→0).
 
-| Layer | Knob CCW | Knob CW | OLED |
-|-------|----------|---------|------|
-| 0 — Volume | Volume Down | Volume Up | `VOL` |
-| 1 — Scroll | Scroll Down | Scroll Up | `SCROLL` |
-| 2 — Brightness | Brightness Down | Brightness Up | `BRIGHT` |
+| Layer | Knob CCW | Knob CW |
+|-------|----------|---------|
+| 0 (VOL) | Volume Down | Volume Up |
+| 1 (SCR) | Scroll Down | Scroll Up |
+| 2 (BRT) | Brightness Down | Brightness Up |
+| 3–5 | *(unbound — shows warning)* | *(unbound — shows warning)* |
 
-The current layer name is shown on the OLED for ~1.6 seconds each time you switch.
+Turning the rotary on an **unbound layer** (3–5) shows a brief **"ROTARY / no bind"** message on the OLED instead of sending a keycode or triggering the comet LED effect.
 
 ---
 
@@ -108,73 +104,60 @@ The current layer name is shown on the OLED for ~1.6 seconds each time you switc
 | Tilt in any direction | Moves the mouse cursor (analog, proportional) |
 | Press (click) | Launches the built-in mini-game (koebiten) |
 
-> The game takes over the display and rotary encoder inputs. Power-cycle or reset to return to normal keyboard mode.
+> The game takes over the display and rotary encoder. Power-cycle or reset to return to normal keyboard mode.
 
 ---
 
 ## RGB LEDs
 
-12 WS2812B LEDs run a continuous **rainbow animation** in idle state, with each LED offset slightly in hue to create a flowing effect.
+12 WS2812B LEDs run a continuous **rainbow animation** at idle, with each LED offset in hue for a flowing effect.
 
-When a key is pressed, the corresponding LED **flashes bright white** and fades back to the rainbow over ~200 ms.
+When a key is pressed, the corresponding LED **flashes bright white** and fades back to rainbow over ~200 ms. The LED index is correctly mapped from the row-major key matrix to the column-major LED wiring, so the lit LED always matches the physical key.
 
-When the **rotary encoder turns**, the LEDs switch to a **white comet** effect: a bright white head LED with two fading trail LEDs chases the direction of rotation. The comet advances one position per encoder notch, so turning slowly moves it slowly; spinning quickly moves it quickly. The LEDs hold the comet for ~800 ms after the last notch, then fade back to rainbow.
+When the **rotary encoder turns**, the LEDs switch to a **white comet** on the outer ring: a bright head with two fading trail LEDs chasing the direction of rotation.
 
 ---
 
 ## OLED Display
 
-The 128×64 OLED has five display states:
-
 | State | Trigger | Content | Duration |
 |-------|---------|---------|----------|
-| Page info | Page change / FN release | Page name + key hint (`abcd efgh`) | 3.2 s, then screensaver |
-| Layer info | Rotary layer change | Layer name (VOL / SCROLL / BRIGHT) | 1.6 s, then page info |
+| Layer info | Layer change / FN release | Layer name + key hints | 3.2 s, then screensaver |
 | FN overlay | FN held | `FN` + `select:` | Until key pressed or FN released |
-| FN preview | FN held + page selected | Selected page name + key hint | 1.5 s, then back to FN overlay |
-| Screensaver | Idle after page info | Bouncing pixel | Until next event |
+| FN preview | FN held + layer selected | New layer name + key hints | 1.5 s, then back to FN overlay |
+| Shift hint | Shift key held | `SHIFT` + uppercased key hints for current layer | Until Shift released |
+| Rotary warning | Rotary turned on unbound layer | `ROTARY` + `no bind` | ~1.5 s, then layer info |
+| Screensaver | Idle | Bouncing pixel | Until next event |
+
+Key hint format: `xxxx Syyy` where `S` = Shift, `x`/`y` = letter/digit/symbol. Navigation layer shows `H^EU <v>D` (H=Home, ^=Up, E=End, U=PgUp, <=Left, v=Down, >=Right, D=PgDn).
 
 ---
 
-## Customisation
+## Vial Customisation
 
-All key assignments live in [`firmware/pages.go`](firmware/pages.go) — no other files need touching for typical customisation.
+Connect the device while Vial is open — all 6 layers are visible and editable live. Changes take effect immediately and are saved to flash. **Note:** firmware defaults are re-applied on each boot to ensure compatibility after firmware upgrades; Vial edits are session-persistent but reset on power cycle or reflash.
 
-### Changing keys on an existing page
+All key assignments live in [`firmware/layers.go`](firmware/layers.go). The `layerKeys` array holds firmware defaults for all six layers (12 keys each, row-major order).
 
-Edit the `keyPages` array. Each page is a `[2][4]Keycode` (2 rows × 4 columns):
+### Changing a key
+
+Edit `layerKeys` in `firmware/layers.go`:
 
 ```go
-// PageLowerA — change 'd' to Tab
-{
-    {jp.KeyA, jp.KeyB, jp.KeyC, jp.KeyTab}, // ← Row 0
-    {jp.KeyE, jp.KeyF, jp.KeyG, jp.KeyH},   //   Row 1
+LayerAG: {
+    jp.KeyA, jp.KeyB, jp.KeyC, jp.KeyTab,  // changed K4 from 'd' to Tab
+    jp.KeyLeftShift, jp.KeyE, jp.KeyF, jp.KeyG,
+    0, jp.KeyBackspace, jp.MouseLeft, jp.MouseRight,
 },
 ```
 
-### Uppercase / shifted characters
-
-Use `lsft(jp.KeyX)` instead of a bare keycode. This encodes the key through the library's proper Shift-modifier path:
-
-```go
-{lsft(jp.KeyA), lsft(jp.KeyB), ...}  // produces A B ...
-```
-
-### Adding a new page
-
-1. Add a constant before `TotalPages` in the `const` block.
-2. Add a `[2][4]Keycode` entry to `keyPages` at the matching index.
-3. Add a display name to `pageNames`.
-4. Wire it to an FN shortcut in `fnPageKeys`.
-
 ### Available keycodes
 
-All standard HID keycodes are available via the `jp` (Japanese layout) or base keycodes packages. Common ones:
-
 ```go
-jp.KeyA … jp.KeyZ          // letters
-jp.Key1 … jp.Key0          // digits
-jp.KeySpace, jp.KeyEnter, jp.KeyBackspace
+jp.KeyA … jp.KeyZ                               // letters
+jp.Key1 … jp.Key0                               // digits
+jp.KeyLeftShift, jp.KeyRightShift               // modifier keys
+jp.KeySpace, jp.KeyEnter, jp.KeyBackspace, jp.KeyDelete
 jp.KeyLeft, jp.KeyRight, jp.KeyUp, jp.KeyDown
 jp.KeyHome, jp.KeyEnd, jp.KeyPageUp, jp.KeyPageDown
 jp.KeyComma, jp.KeyPeriod, jp.KeySlash, jp.KeyMinus

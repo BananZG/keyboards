@@ -13,11 +13,12 @@ import (
 // ---- Display state constants ----
 
 const (
-	showPageInfo    = iota // briefly show page layout after a page change
-	showLayerInfo          // briefly show rotary layer name after a layer change
-	showFNOverlay          // FN key held, waiting for page selection
-	showFNPreview          // FN held + page selected: show page name briefly
-	showScreensaver        // bouncing-pixel screensaver
+	showPageInfo      = iota // show current layer name + key hints
+	showFNOverlay            // FN key held, waiting for layer selection
+	showFNPreview            // FN held + layer selected: show preview briefly
+	showShiftHint            // Shift key physically held
+	showRotaryWarning        // rotary turned on a layer with no bound action
+	showScreensaver          // bouncing-pixel screensaver
 )
 
 // ---- Colours ----
@@ -29,37 +30,67 @@ var (
 
 // ---- Render helpers ----
 
-// rotaryLayerNames maps vial layer index to a short display label.
-var rotaryLayerNames = [3]string{"VOL", "SCROLL", "BRIGHT"}
-
-// renderPageInfo writes the current page name and key layout to the LCD.
-// Called once on page change; no heap allocations.
-func renderPageInfo(display *ssd1306.Device, buf *DisplayBuffer, page int) {
+// renderLayerInfo writes the current layer name and a key-hint row to the OLED.
+// Line 1 (y=20): layer display name (e.g. "a-g  VOL").
+// Line 2 (y=50): 9-char hint "xxxx yyyy" built from firmware-default keycodes.
+// Called once per layer change; no heap allocations.
+func renderLayerInfo(display *ssd1306.Device, buf *DisplayBuffer, layer int) {
 	display.ClearDisplay()
 
-	// Line 1: page name centred
-	name := GetPageName(page)
-	_, w := tinyfont.LineWidth(&freemono.Regular12pt7b, "PAGE "+name)
-	tinyfont.WriteLine(display, &freemono.Regular12pt7b,
-		int16(128-w)/2, 20, "PAGE "+name, textWhite)
+	// Line 1: layer name (centred)
+	name := layerDisplayNames[layer]
+	_, w := tinyfont.LineWidth(&freemono.Regular12pt7b, name)
+	tinyfont.WriteLine(display, &freemono.Regular12pt7b, int16(128-w)/2, 20, name, textWhite)
 
-	// Line 2: key hints for rows 0-1
-	if page < TotalPages {
-		var hint [9]byte
-		row0 := keyPages[page][0]
-		for i, kc := range row0 {
-			hint[i] = keycodeToRune(kc)
-		}
-		hint[4] = ' '
-		row1 := keyPages[page][1]
-		for i, kc := range row1 {
-			hint[5+i] = keycodeToRune(kc)
-		}
-		tinyfont.WriteLine(display, &freemono.Regular12pt7b, 4, 50, string(hint[:]), textWhite)
+	// Line 2: key hints — row 0 (idx 0-3) then space then row 1 (idx 4-7)
+	var hint [9]byte
+	for i := 0; i < 4; i++ {
+		hint[i] = keycodeToRune(layerKeys[layer][i])
 	}
+	hint[4] = ' '
+	for i := 0; i < 4; i++ {
+		hint[5+i] = keycodeToRune(layerKeys[layer][4+i])
+	}
+	tinyfont.WriteLine(display, &freemono.Regular12pt7b, 4, 50, string(hint[:]), textWhite)
 
 	display.Display()
 	_ = buf
+}
+
+// renderShiftHint shows "SHIFT" on line 1 and uppercased key hints on line 2.
+// Called while the Shift key is physically held.
+func renderShiftHint(display *ssd1306.Device, buf *DisplayBuffer, layer int) {
+	display.ClearDisplay()
+	_, w := tinyfont.LineWidth(&freemono.Regular12pt7b, "SHIFT")
+	tinyfont.WriteLine(display, &freemono.Regular12pt7b, int16(128-w)/2, 20, "SHIFT", textWhite)
+	// Key hints uppercased — shows what Shift+key produces on this layer.
+	var hint [9]byte
+	upcase := func(b byte) byte {
+		if b >= 'a' && b <= 'z' {
+			return b - 32
+		}
+		return b
+	}
+	for i := 0; i < 4; i++ {
+		hint[i] = upcase(keycodeToRune(layerKeys[layer][i]))
+	}
+	hint[4] = ' '
+	for i := 0; i < 4; i++ {
+		hint[5+i] = upcase(keycodeToRune(layerKeys[layer][4+i]))
+	}
+	tinyfont.WriteLine(display, &freemono.Regular12pt7b, 4, 50, string(hint[:]), textWhite)
+	display.Display()
+	_ = buf
+}
+
+// renderRotaryWarning shows a brief "unbound" indicator when the rotary
+// encoder is turned on a layer without a dedicated action.
+func renderRotaryWarning(display *ssd1306.Device) {
+	display.ClearDisplay()
+	_, w := tinyfont.LineWidth(&freemono.Regular12pt7b, "ROTARY")
+	tinyfont.WriteLine(display, &freemono.Regular12pt7b, int16(128-w)/2, 20, "ROTARY", textWhite)
+	tinyfont.WriteLine(display, &freemono.Regular12pt7b, 4, 50, "no bind", textWhite)
+	display.Display()
 }
 
 // renderFNInfo shows the FN-held overlay: "FN" + short instruction.
@@ -69,19 +100,6 @@ func renderFNInfo(display *ssd1306.Device) {
 	tinyfont.WriteLine(display, &freemono.Regular12pt7b,
 		int16(128-w)/2, 20, "FN", textWhite)
 	tinyfont.WriteLine(display, &freemono.Regular12pt7b, 4, 50, "select:", textWhite)
-	display.Display()
-}
-
-// renderLayerInfo shows the active rotary layer name on the LCD.
-func renderLayerInfo(display *ssd1306.Device, layer int) {
-	display.ClearDisplay()
-	name := "?"
-	if layer >= 0 && layer < len(rotaryLayerNames) {
-		name = rotaryLayerNames[layer]
-	}
-	_, w := tinyfont.LineWidth(&freemono.Regular12pt7b, name)
-	tinyfont.WriteLine(display, &freemono.Regular12pt7b,
-		int16(128-w)/2, 40, name, textWhite)
 	display.Display()
 }
 
@@ -143,10 +161,28 @@ func keycodeToRune(kc Keycode) byte {
 			return '0'
 		}
 		return byte('1' + hid - 0x1E)
+	case kc == jp.KeyLeftShift || kc == jp.KeyRightShift:
+		return 'S'
+	case kc == jp.KeyLeft:
+		return '<'
+	case kc == jp.KeyRight:
+		return '>'
+	case kc == jp.KeyUp:
+		return '^'
+	case kc == jp.KeyDown:
+		return 'v'
+	case kc == jp.KeyHome:
+		return 'H'
+	case kc == jp.KeyEnd:
+		return 'E'
+	case kc == jp.KeyPageUp:
+		return 'U'
+	case kc == jp.KeyPageDown:
+		return 'D'
 	case kc == jp.KeySpace:
 		return '_'
 	case kc == jp.KeyEnter:
-		return 'E'
+		return 'N'
 	case kc == jp.KeyComma:
 		return ','
 	case kc == jp.KeyPeriod:

@@ -73,106 +73,135 @@ func run() error {
 	colPins := []machine.Pin{machine.GPIO5, machine.GPIO6, machine.GPIO7, machine.GPIO8}
 	rowPins := []machine.Pin{machine.GPIO9, machine.GPIO10, machine.GPIO11}
 
-	// Page manager - allocated on stack, no heap
-	var pm PageManager
-	pm.Init()
-
 	// ---- Matrix keyboard ----
-	// The tinygo-keyboard library calls our callback with the *vial layer*
-	// index (0-2) and the *physical key index* (0-11, row-major).
-	// We use the library's layer mechanism only for the rotary knob.
-	// For the matrix we always register on layer 0 and drive our own page
-	// logic here.
+	// All six Vial layers are registered with firmware-default keycodes.
+	// After d.Init() the defaults are re-applied to overwrite any stale flash.
 	//
 	// Physical index layout (row-major, 4 cols × 3 rows):
-	//   Row 0: idx 0-3
-	//   Row 1: idx 4-7
-	//   Row 2: idx 8-11  →  FN(8) | Backspace(9) | MouseL(10) | MouseR(11)
-	//
-	// We give the matrix a single layer of placeholder codes; actual output
-	// is controlled via the callback + pm.EffectivePage().
-	// Build initial matrix layer: rows 0-1 start on PageLowerA, row 2 is fixed.
-	// d.SetKeycode(layer, kbIndex, index, key) updates rows 0-1 on page change.
-	// The initial keycodes passed to AddMatrixKeyboard are immediately overwritten
-	// by fillLayerKeys below, so pass a zero-initialized placeholder.
-	var blankLayer [12]keyboard.Keycode
+	//   Row 0 (idx 0-3):  K1 K2 K3 K4
+	//   Row 1 (idx 4-7):  Sft K6 K7 K8   (Shift at index 4 on layers 0-3)
+	//   Row 2 (idx 8-11): FN(8) Del(9) MouseL(10) MouseR(11)
+	mk := d.AddMatrixKeyboard(colPins, rowPins, [][]keyboard.Keycode{
+		layerKeys[0][:],
+		layerKeys[1][:],
+		layerKeys[2][:],
+		layerKeys[3][:],
+		layerKeys[4][:],
+		layerKeys[5][:],
+	})
 
-	mk := d.AddMatrixKeyboard(colPins, rowPins, [][]keyboard.Keycode{blankLayer[:]})
-	// Prime all three rotary layers so the keyboard works before the first FN press.
-	fillLayerKeys(d, PageLowerA)
-	setMatrixKey(d, 9, jp.KeyBackspace)
-	setMatrixKey(d, 10, jp.MouseLeft)
-	setMatrixKey(d, 11, jp.MouseRight)
+	// fnKeyCache saves all six layers × 12 keys during FN hold so that
+	// Vial-configured keycodes survive a press-release cycle unchanged.
+	// Stack cost: 6 × 12 × 2 = 144 bytes.
+	var fnKeyCache [keyboard.LayerCount][12]keyboard.Keycode
+	var fnActive bool             // true while FN key is held
+	var fnPreviewLayer = int8(-1) // layer being previewed during FN hold, -1 = none
+	var displayUpdate = true      // trigger initial layer display on startup
+	var shiftHeld bool            // true while Shift is physically held
+	var rotaryWarning bool        // set when rotary turned on an unbound layer
 
 	mk.SetCallback(func(layer, index int, state keyboard.State) {
-		row := index / 4
-		col := index % 4
-
-		// ---- FN key (row 2, col 0) ----
-		// When held: zero rows 0-1 so no letters fire.
-		// When released: restore current page keycodes.
-		if row == 2 && col == 0 {
+		// ---- FN key (row 2, col 0 = index 8) ----
+		if index == 8 {
 			if state == keyboard.Press {
-				pm.SetFN(true)
-				// Zero ALL matrix keycodes on every rotary layer while FN is
-				// held so no keys fire regardless of the active rotary layer.
-				for i := 0; i < 12; i++ {
-					setMatrixKey(d, i, 0)
+				fnActive = true
+				fnPreviewLayer = -1
+				displayUpdate = true
+				// Cache all six layers so Vial keycodes can be restored on release.
+				for l := 0; l < keyboard.LayerCount; l++ {
+					for i := 0; i < 12; i++ {
+						fnKeyCache[l][i] = mk.Key(l, i)
+					}
+				}
+				// Install FN overlay: K1-K6 (idx 0-5) switch layers 0-5;
+				// K7-K8 (idx 6-7) suppressed; row-2 (idx 9-11) get Tab/Space/Enter.
+				for l := 0; l < keyboard.LayerCount; l++ {
+					d.SetKeycode(l, 0, 0, jp.KeyTo0)
+					d.SetKeycode(l, 0, 1, jp.KeyTo1)
+					d.SetKeycode(l, 0, 2, jp.KeyTo2)
+					d.SetKeycode(l, 0, 3, jp.KeyTo3)
+					d.SetKeycode(l, 0, 4, jp.KeyTo4)
+					d.SetKeycode(l, 0, 5, jp.KeyTo5)
+					d.SetKeycode(l, 0, 6, 0)
+					d.SetKeycode(l, 0, 7, 0)
+					d.SetKeycode(l, 0, 9, fnRow2Keys[0])
+					d.SetKeycode(l, 0, 10, fnRow2Keys[1])
+					d.SetKeycode(l, 0, 11, fnRow2Keys[2])
 				}
 			} else if state == keyboard.PressToRelease {
-				pm.SetFN(false)
-				fillLayerKeys(d, int(pm.currentPage))
-				// Restore fixed row-2 non-FN keys on all rotary layers
-				setMatrixKey(d, 9, jp.KeyBackspace)
-				setMatrixKey(d, 10, jp.MouseLeft)
-				setMatrixKey(d, 11, jp.MouseRight)
+				fnActive = false
+				fnPreviewLayer = -1
+				displayUpdate = true
+				// Restore all six layers from cache.
+				for l := 0; l < keyboard.LayerCount; l++ {
+					for i := 0; i < 12; i++ {
+						d.SetKeycode(l, 0, i, fnKeyCache[l][i])
+					}
+				}
 			}
 			return
 		}
 
-		// ---- FN held + key press → page selection (all rows) ----
-		// fnPageKeys returns -1 for the FN key itself (row2,col0), so it is safe
-		// to remove the row<2 guard that was previously preventing row-3 shortcuts.
-		if pm.fnPressed && state == keyboard.Press {
-			if target := GetFNPageTarget(row, col); target >= 0 {
-				pm.SetPage(target)
-				// Keycodes restored to the new page when FN is released.
-			}
-			return
+		// Track which layer the user selected while FN is held.
+		// KeyTo0-5 are installed at indices 0-5, so index == target layer.
+		if fnActive && state == keyboard.Press && index < keyboard.LayerCount {
+			fnPreviewLayer = int8(index)
+			displayUpdate = true
 		}
 
-		// ---- LED flash on key press ----
-		// Key sending for rows 0-1 and fixed row-2 keys is handled by the library
-		// based on the keycodes registered via SetKeycode / AddMatrixKeyboard.
+		// Detect Shift press/release for the screen hint (only outside FN mode).
+		if !fnActive {
+			kc := mk.Key(layer, index)
+			if kc == jp.KeyLeftShift || kc == jp.KeyRightShift {
+				if state == keyboard.Press {
+					shiftHeld = true
+					displayUpdate = true
+				} else if state == keyboard.PressToRelease {
+					shiftHeld = false
+					displayUpdate = true
+				}
+			}
+		}
+
+		// LED flash on key press.
+		// Matrix keys use row-major index (row*4+col) but LEDs are wired
+		// column-major (col0=0-2, col1=3-5, col2=6-8, col3=9-11), so convert.
 		if state == keyboard.Press {
+			ledIdx := (index%4)*3 + index/4
 			mask := interrupt.Disable()
-			wsFlash[index] = 6 // 6 × 32 ms ≈ 192 ms fade
+			wsFlash[ledIdx] = 6 // 6 × 32 ms ≈ 192 ms fade
 			interrupt.Restore(mask)
 		}
 	})
 
-	// MouseLeft (index 10) and MouseRight (index 11) are part of the matrix.
-	// jp.MouseLeft / jp.MouseRight keycodes handle clicks via the library.
-
-	// ---- Rotary encoder (unchanged from original) ----
+	// ---- Rotary encoder ----
+	// Layers 0-2 define the rotary mode; layers 3-5 default to volume.
 	rotaryPins := [2]machine.Pin{machine.GPIO3, machine.GPIO4}
 	if invertRotaryPins {
 		rotaryPins[0], rotaryPins[1] = rotaryPins[1], rotaryPins[0]
 	}
 	rk := d.AddRotaryKeyboard(rotaryPins[0], rotaryPins[1], [][]keyboard.Keycode{
-		{jp.KeyMediaVolumeDec, jp.KeyMediaVolumeInc},         // layer 0: volume
-		{jp.WheelDown, jp.WheelUp},                           // layer 1: scroll
-		{jp.KeyMediaBrightnessDown, jp.KeyMediaBrightnessUp}, // layer 2: brightness
+		rkLayerKeys[0][:],
+		rkLayerKeys[1][:],
+		rkLayerKeys[2][:],
+		rkLayerKeys[3][:],
+		rkLayerKeys[4][:],
+		rkLayerKeys[5][:],
 	})
-	// When the rotary turns, show a white comet chasing the direction.
-	// index 0 = CCW (decrease), index 1 = CW (increase).
+	// Comet effect only on layers with a named rotary action (layers 0-2).
+	// On unbound layers a brief warning is shown on the OLED instead.
 	rk.SetCallback(func(layer, index int, state keyboard.State) {
 		if state == keyboard.Press {
-			dir := 1
-			if index == 0 {
-				dir = -1
+			if layerRotaryLabel[layer] != "" {
+				dir := 1
+				if index == 0 {
+					dir = -1
+				}
+				RotarySpinAdvance(dir)
+			} else {
+				rotaryWarning = true
+				displayUpdate = true
 			}
-			RotarySpinAdvance(dir)
 		}
 	})
 
@@ -180,28 +209,44 @@ func run() error {
 	for _, p := range gpioPins {
 		p.Configure(machine.PinConfig{Mode: machine.PinInputPullup})
 	}
-	var koebitenEnable bool // set true by gk callback, consumed in main loop
+	var koebitenEnable bool
+	// Rotary button (index 1): cycles through all 6 layers in order (0→1→2→...→0).
+	// Joystick (index 0): no keycode — game mode is triggered by the callback.
 	gk := d.AddGpioKeyboard(gpioPins, [][]keyboard.Keycode{
-		{jp.KeyTo5, jp.KeyTo1},
-		{jp.KeyTo5, jp.KeyTo2},
-		{jp.KeyTo5, jp.KeyTo0},
+		gkLayerKeys[0][:],
+		gkLayerKeys[1][:],
+		gkLayerKeys[2][:],
+		gkLayerKeys[3][:],
+		gkLayerKeys[4][:],
+		gkLayerKeys[5][:],
 	})
-	// On joystick press: library sends KeyTo5, moving to layer 5.
-	// On release at layer 5: signal game launch to the main loop.
+	// Joystick press (index 0, PressToRelease) triggers game mode directly,
+	// independent of the active Vial layer.
 	gk.SetCallback(func(layer, index int, state keyboard.State) {
-		if state == keyboard.PressToRelease && d.Layer() == 5 {
+		if index == 0 && state == keyboard.PressToRelease {
 			koebitenEnable = true
 		}
 	})
 
 	loadKeyboardDef()
 	d.Init()
+	// Re-apply firmware defaults after Init() so stale flash from a previous
+	// firmware version is immediately overwritten for all three keyboard devices.
+	for l := 0; l < keyboard.LayerCount; l++ {
+		for i := 0; i < 12; i++ {
+			d.SetKeycode(l, 0, i, layerKeys[l][i]) // matrix  (kbIndex 0)
+		}
+		d.SetKeycode(l, 1, 0, rkLayerKeys[l][0]) // rotary  (kbIndex 1)
+		d.SetKeycode(l, 1, 1, rkLayerKeys[l][1])
+		d.SetKeycode(l, 2, 0, gkLayerKeys[l][0]) // GPIO    (kbIndex 2)
+		d.SetKeycode(l, 2, 1, gkLayerKeys[l][1])
+	}
 
 	// ---- State ----
 	var (
 		displayMode  = showPageInfo
 		displayTimer = 0
-		rotaryLayer  = 0 // mirrors d.Layer() to detect rotary layer changes
+		currentLayer = 0 // mirrors d.Layer() to detect changes
 	)
 
 	ss := screensaverState{dx: 1, dy: 1}
@@ -230,13 +275,14 @@ func run() error {
 			game.RunCurrentGame()
 		}
 
-		// Detect rotary layer changes (GPIO keyboard sends KeyTo0/1/2/5)
-		if cur := d.Layer(); cur != rotaryLayer {
-			rotaryLayer = cur
-			if cur < 5 { // layer 5 is game mode; handled above
-				displayMode = showLayerInfo
+		// Detect layer changes (rotary button cycles layers 0-2).
+		// FN-triggered changes are handled by the mk callback directly.
+		if cur := d.Layer(); cur != currentLayer {
+			currentLayer = cur
+			if !fnActive {
+				displayMode = showPageInfo
+				displayUpdate = true
 				displayTimer = 0
-				renderLayerInfo(display, cur)
 			}
 		}
 
@@ -292,24 +338,33 @@ func run() error {
 			interrupt.Restore(mask)
 		}
 
-		// Display update (every 16ms)
+		// Display update (every 16 ms)
 		if cnt%16 == 0 {
-			if pm.ConsumeDisplayUpdate() {
-				if pm.fnPressed {
-					switch displayMode {
-					case showFNOverlay, showFNPreview:
-						// Page selected while FN held → preview new page name
-						renderPageInfo(display, displayBuf, int(pm.currentPage))
-						displayMode = showFNPreview
-						displayTimer = 0
-					default:
-						// FN key just pressed → show FN overlay
-						renderFNInfo(display)
-						displayMode = showFNOverlay
-					}
-				} else {
-					// FN released or normal page change
-					renderPageInfo(display, displayBuf, pm.EffectivePage())
+			if displayUpdate {
+				displayUpdate = false
+				switch {
+				case fnActive && fnPreviewLayer >= 0:
+					// FN held + layer key pressed: preview selected layer.
+					renderLayerInfo(display, displayBuf, int(fnPreviewLayer))
+					displayMode = showFNPreview
+					displayTimer = 0
+				case fnActive:
+					// FN just pressed: show overlay.
+					renderFNInfo(display)
+					displayMode = showFNOverlay
+				case shiftHeld:
+					// Shift held: show uppercased key hints.
+					renderShiftHint(display, displayBuf, currentLayer)
+					displayMode = showShiftHint
+				case rotaryWarning:
+					// Rotary turned on unbound layer: show brief warning.
+					rotaryWarning = false
+					renderRotaryWarning(display)
+					displayMode = showRotaryWarning
+					displayTimer = 0
+				default:
+					// Normal mode: show current layer.
+					renderLayerInfo(display, displayBuf, currentLayer)
 					displayMode = showPageInfo
 					displayTimer = 0
 				}
@@ -321,20 +376,23 @@ func run() error {
 				if displayTimer > 200 { // ~3.2 s
 					displayMode = showScreensaver
 				}
-			case showLayerInfo:
+			case showShiftHint:
+				// Stays until Shift release triggers displayUpdate.
+			case showRotaryWarning:
 				displayTimer++
-				if displayTimer > 100 { // ~1.6 s
+				if displayTimer > 96 { // ~1.5 s then back to layer info
+					renderLayerInfo(display, displayBuf, currentLayer)
 					displayMode = showPageInfo
-					renderPageInfo(display, displayBuf, pm.EffectivePage())
 					displayTimer = 0
 				}
 			case showFNOverlay:
-				// Stays until ConsumeDisplayUpdate fires (page selected or FN released)
+				// Stays until displayUpdate fires (layer selected or FN released).
 			case showFNPreview:
 				displayTimer++
 				if displayTimer > 96 { // ~1.5 s
 					renderFNInfo(display)
 					displayMode = showFNOverlay
+					fnPreviewLayer = -1
 					displayTimer = 0
 				}
 			case showScreensaver:
@@ -345,24 +403,6 @@ func run() error {
 		cnt++
 		if cnt >= 160 { // LCM(10, 16, 32): all three update intervals divide evenly
 			cnt = 0
-		}
-	}
-}
-
-// setMatrixKey sets a matrix keycode on all three rotary layers (0-2) so the
-// key works regardless of which rotary encoder mode is currently active.
-func setMatrixKey(d *keyboard.Device, idx int, key keyboard.Keycode) {
-	d.SetKeycode(0, 0, idx, key)
-	d.SetKeycode(1, 0, idx, key)
-	d.SetKeycode(2, 0, idx, key)
-}
-
-// fillLayerKeys updates rows 0-1 of the matrix for the given page across all
-// rotary layers so typing works in every rotary encoder mode.
-func fillLayerKeys(d *keyboard.Device, page int) {
-	for row := 0; row < 2; row++ {
-		for col := 0; col < 4; col++ {
-			setMatrixKey(d, row*4+col, keyPages[page][row][col])
 		}
 	}
 }
